@@ -2855,18 +2855,27 @@ void TabletImpl::LoadTable(RpcController* controller, const ::openmldb::api::Loa
             response->set_msg("write data failed");
             break;
         }
-        if (CreateTableInternal(&table_meta, msg) < 0) {
-            response->set_code(::openmldb::base::ReturnCode::kCreateTableFailed);
-            response->set_msg(msg.c_str());
-            break;
+
+        if (table_meta.storage_mode() == openmldb::common::kMemory) {
+            if (CreateTableInternal(&table_meta, msg) < 0) {
+                response->set_code(::openmldb::base::ReturnCode::kCreateTableFailed);
+                response->set_msg(msg.c_str());
+                break;
+            }
+            std::string name = table_meta.name();
+            uint32_t seg_cnt = 8;
+            if (table_meta.seg_cnt() > 0) {
+                seg_cnt = table_meta.seg_cnt();
+            }
+            PDLOG(INFO, "start to recover table with id %u pid %u name %s seg_cnt %d ", tid, pid, name.c_str(),
+                  seg_cnt);
+            task_pool_.AddTask(boost::bind(&TabletImpl::LoadTableInternal, this, tid, pid, task_ptr));
+        } else {
+            task_pool_.AddTask(boost::bind(&TabletImpl::LoadDiskTableInternal, this, tid, pid, table_meta, task_ptr));
+            PDLOG(INFO, "load table tid[%u] pid[%u] storage mode[%s]", tid, pid,
+                  ::openmldb::common::StorageMode_Name(table_meta.storage_mode()).c_str());
         }
-        std::string name = table_meta.name();
-        uint32_t seg_cnt = 8;
-        if (table_meta.seg_cnt() > 0) {
-            seg_cnt = table_meta.seg_cnt();
-        }
-        PDLOG(INFO, "start to recover table with id %u pid %u name %s seg_cnt %d ", tid, pid, name.c_str(), seg_cnt);
-        task_pool_.AddTask(boost::bind(&TabletImpl::LoadTableInternal, this, tid, pid, task_ptr));
+
         response->set_code(::openmldb::base::ReturnCode::kOk);
         response->set_msg("ok");
         return;
