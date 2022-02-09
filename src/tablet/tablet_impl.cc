@@ -54,6 +54,8 @@
 #include "storage/binlog.h"
 #include "storage/segment.h"
 #include "tablet/file_sender.h"
+#include "storage/table.h"
+#include "storage/disk_table_snapshot.h"
 
 using google::protobuf::RepeatedPtrField;
 using ::openmldb::base::ReturnCode;
@@ -68,6 +70,8 @@ DECLARE_uint32(scan_max_bytes_size);
 DECLARE_uint32(scan_reserve_size);
 DECLARE_double(mem_release_rate);
 DECLARE_string(db_root_path);
+DECLARE_string(ssd_root_path);
+DECLARE_string(hdd_root_path);
 DECLARE_bool(binlog_notify_on_put);
 DECLARE_int32(task_pool_size);
 DECLARE_int32(io_pool_size);
@@ -77,6 +81,8 @@ DECLARE_uint32(make_snapshot_offline_interval);
 DECLARE_bool(recycle_bin_enabled);
 DECLARE_uint32(recycle_ttl);
 DECLARE_string(recycle_bin_root_path);
+DECLARE_string(recycle_ssd_bin_root_path);
+DECLARE_string(recycle_hdd_bin_root_path);
 DECLARE_int32(make_snapshot_threshold_offset);
 DECLARE_uint32(get_table_diskused_interval);
 DECLARE_uint32(task_check_interval);
@@ -153,8 +159,16 @@ bool TabletImpl::Init(const std::string& zk_cluster, const std::string& zk_path,
     endpoint_ = endpoint;
     notify_path_ = zk_path + "/table/notify";
     sp_root_path_ = zk_path + "/store_procedure/db_sp_data";
-    ::openmldb::base::SplitString(FLAGS_db_root_path, ",", mode_root_paths_);
-    ::openmldb::base::SplitString(FLAGS_recycle_bin_root_path, ",", mode_recycle_root_paths_);
+    ::openmldb::base::SplitString(FLAGS_db_root_path, ",", mode_root_paths_[::openmldb::common::kMemory]);
+    ::openmldb::base::SplitString(FLAGS_ssd_root_path, ",", mode_root_paths_[::openmldb::common::kSSD]);
+    ::openmldb::base::SplitString(FLAGS_hdd_root_path, ",", mode_root_paths_[::openmldb::common::kHDD]);
+
+    ::openmldb::base::SplitString(FLAGS_recycle_bin_root_path, ",",
+                                  mode_recycle_root_paths_[::openmldb::common::kMemory]);
+    ::openmldb::base::SplitString(FLAGS_recycle_ssd_bin_root_path, ",",
+                                  mode_recycle_root_paths_[::openmldb::common::kSSD]);
+    ::openmldb::base::SplitString(FLAGS_recycle_hdd_bin_root_path, ",",
+                                  mode_recycle_root_paths_[::openmldb::common::kHDD]);
     if (!zk_cluster.empty()) {
         zk_client_ = new ZkClient(zk_cluster, real_endpoint, FLAGS_zk_session_timeout, endpoint, zk_path);
         bool ok = zk_client_->Init();
@@ -192,13 +206,39 @@ bool TabletImpl::Init(const std::string& zk_cluster, const std::string& zk_path,
         return false;
     }
 
-    if (!CreateMultiDir(mode_root_paths_)) {
-        PDLOG(WARNING, "fail to create db root path %s", FLAGS_db_root_path.c_str());
+    if (!CreateMultiDir(mode_root_paths_[::openmldb::common::kMemory])) {
+        PDLOG(WARNING, "fail to create db root path %s",
+              FLAGS_db_root_path.c_str());
         return false;
     }
 
-    if (!CreateMultiDir(mode_recycle_root_paths_)) {
-        PDLOG(WARNING, "fail to create recycle bin root path %s", FLAGS_recycle_bin_root_path.c_str());
+    if (!CreateMultiDir(mode_root_paths_[::openmldb::common::kSSD])) {
+        PDLOG(WARNING, "fail to create ssd root path %s",
+              FLAGS_ssd_root_path.c_str());
+        return false;
+    }
+
+    if (!CreateMultiDir(mode_root_paths_[::openmldb::common::kHDD])) {
+        PDLOG(WARNING, "fail to create hdd root path %s",
+              FLAGS_hdd_root_path.c_str());
+        return false;
+    }
+
+    if (!CreateMultiDir(mode_recycle_root_paths_[::openmldb::common::kMemory])) {
+        PDLOG(WARNING, "fail to create recycle bin root path %s",
+              FLAGS_recycle_bin_root_path.c_str());
+        return false;
+    }
+
+    if (!CreateMultiDir(mode_recycle_root_paths_[::openmldb::common::kSSD])) {
+        PDLOG(WARNING, "fail to create recycle ssd bin root path %s",
+              FLAGS_recycle_ssd_bin_root_path.c_str());
+        return false;
+    }
+
+    if (!CreateMultiDir(mode_recycle_root_paths_[::openmldb::common::kHDD])) {
+        PDLOG(WARNING, "fail to create recycle bin root path %s",
+              FLAGS_recycle_hdd_bin_root_path.c_str());
         return false;
     }
 
@@ -2138,7 +2178,8 @@ void TabletImpl::UpdateTableMetaForAddField(RpcController* controller,
         table->SetTableMeta(table_meta);
         // update TableMeta.txt
         std::string db_root_path;
-        bool ok = ChooseDBRootPath(tid, pid, db_root_path);
+        ::openmldb::common::StorageMode mode = table_meta.storage_mode();
+        bool ok = ChooseDBRootPath(tid, pid, mode, db_root_path);
         if (!ok) {
             response->set_code(ReturnCode::kFailToGetDbRootPath);
             response->set_msg("fail to get db root path");
@@ -2412,7 +2453,11 @@ void TabletImpl::SendData(RpcController* controller, const ::openmldb::api::Send
     uint32_t tid = request->tid();
     uint32_t pid = request->pid();
     std::string db_root_path;
-    bool ok = ChooseDBRootPath(tid, pid, db_root_path);
+    ::openmldb::common::StorageMode mode = ::openmldb::common::kMemory;
+    if (request->has_storage_mode()) {
+        mode = request->storage_mode();
+    }
+    bool ok = ChooseDBRootPath(tid, pid, mode, db_root_path);
     if (!ok) {
         response->set_code(::openmldb::base::ReturnCode::kFailToGetDbRootPath);
         response->set_msg("fail to get db root path");
@@ -2581,7 +2626,7 @@ void TabletImpl::SendSnapshotInternal(const std::string& endpoint, uint32_t tid,
             break;
         }
         std::string db_root_path;
-        bool ok = ChooseDBRootPath(tid, pid, db_root_path);
+        bool ok = ChooseDBRootPath(tid, pid, table->GetStorageMode(), db_root_path);
         if (!ok) {
             PDLOG(WARNING, "fail to get db root path for table tid %u, pid %u", tid, pid);
             break;
@@ -2779,7 +2824,7 @@ void TabletImpl::LoadTable(RpcController* controller, const ::openmldb::api::Loa
             break;
         }
         std::string root_path;
-        bool ok = ChooseDBRootPath(tid, pid, root_path);
+        bool ok = ChooseDBRootPath(tid, pid, table_meta.storage_mode(), root_path);
         if (!ok) {
             response->set_code(::openmldb::base::ReturnCode::kFailToGetDbRootPath);
             response->set_msg("fail to get table db root path");
@@ -2899,7 +2944,7 @@ int32_t TabletImpl::DeleteTableInternal(uint32_t tid, uint32_t pid,
             break;
         }
 
-        bool ok = ChooseDBRootPath(tid, pid, root_path);
+        bool ok = ChooseDBRootPath(tid, pid, table->GetStorageMode(), root_path);
         if (!ok) {
             PDLOG(WARNING, "fail to get db root path. tid %u pid %u", tid, pid);
             break;
@@ -3003,7 +3048,7 @@ void TabletImpl::CreateTable(RpcController* controller, const ::openmldb::api::C
     PDLOG(INFO, "start creating table tid[%u] pid[%u] with mode %s", tid, pid,
           ::openmldb::api::TableMode_Name(request->table_meta().mode()).c_str());
     std::string db_root_path;
-    bool ok = ChooseDBRootPath(tid, pid, db_root_path);
+    bool ok = ChooseDBRootPath(tid, pid, table_meta->storage_mode(), db_root_path);
     if (!ok) {
         PDLOG(WARNING, "fail to find db root path tid[%u] pid[%u]", tid, pid);
         response->set_code(::openmldb::base::ReturnCode::kFailToGetDbRootPath);
@@ -3106,9 +3151,10 @@ void TabletImpl::GetTableFollower(RpcController* controller, const ::openmldb::a
     response->set_code(::openmldb::base::ReturnCode::kOk);
 }
 
-int32_t TabletImpl::GetSnapshotOffset(uint32_t tid, uint32_t pid, std::string& msg, uint64_t& term, uint64_t& offset) {
+int32_t TabletImpl::GetSnapshotOffset(uint32_t tid, uint32_t pid, openmldb::common::StorageMode storageMode,
+         std::string& msg, uint64_t& term, uint64_t& offset) {
     std::string db_root_path;
-    bool ok = ChooseDBRootPath(tid, pid, db_root_path);
+    bool ok = ChooseDBRootPath(tid, pid, storageMode, db_root_path);
     if (!ok) {
         msg = "fail to get db root path";
         PDLOG(WARNING, "fail to get table db root path");
@@ -3243,7 +3289,11 @@ void TabletImpl::DeleteBinlog(RpcController* controller, const ::openmldb::api::
     uint32_t tid = request->tid();
     uint32_t pid = request->pid();
     std::string db_root_path;
-    bool ok = ChooseDBRootPath(tid, pid, db_root_path);
+    ::openmldb::common::StorageMode mode = ::openmldb::common::kMemory;
+    if (request->has_storage_mode()) {
+        mode = request->storage_mode();
+    }
+    bool ok = ChooseDBRootPath(tid, pid, mode, db_root_path);
     if (!ok) {
         response->set_code(::openmldb::base::ReturnCode::kFailToGetDbRootPath);
         response->set_msg("fail to get db root path");
@@ -3282,7 +3332,11 @@ void TabletImpl::CheckFile(RpcController* controller, const ::openmldb::api::Che
     uint32_t tid = request->tid();
     uint32_t pid = request->pid();
     std::string db_root_path;
-    bool ok = ChooseDBRootPath(tid, pid, db_root_path);
+    ::openmldb::common::StorageMode mode = ::openmldb::common::kMemory;
+    if (request->has_storage_mode()) {
+        mode = request->storage_mode();
+    }
+    bool ok = ChooseDBRootPath(tid, pid, mode, db_root_path);
     if (!ok) {
         response->set_code(::openmldb::base::ReturnCode::kFailToGetDbRootPath);
         response->set_msg("fail to get db root path");
@@ -3324,7 +3378,11 @@ void TabletImpl::GetManifest(RpcController* controller, const ::openmldb::api::G
     std::string db_root_path;
     uint32_t tid = request->tid();
     uint32_t pid = request->pid();
-    bool ok = ChooseDBRootPath(tid, pid, db_root_path);
+    ::openmldb::common::StorageMode mode = ::openmldb::common::kMemory;
+    if (request->has_storage_mode()) {
+        mode = request->storage_mode();
+    }
+    bool ok = ChooseDBRootPath(tid, pid, mode, db_root_path);
     if (!ok) {
         response->set_code(::openmldb::base::ReturnCode::kFailToGetDbRootPath);
         response->set_msg("fail to get db root path");
@@ -3419,6 +3477,13 @@ int TabletImpl::CreateTableInternal(const ::openmldb::api::TableMeta* table_meta
             return -1;
         }
     }
+    std::string db_root_path;
+    bool ok = ChooseDBRootPath(tid, pid, table_meta->storage_mode(), db_root_path);
+    if (!ok) {
+        PDLOG(WARNING, "fail to get table db root path");
+        msg.assign("fail to get table db root path");
+        return -1;
+    }
     std::lock_guard<SpinMutex> spin_lock(spin_mutex_);
     std::shared_ptr<Table> table = GetTableUnLock(tid, pid);
     if (table) {
@@ -3426,20 +3491,24 @@ int TabletImpl::CreateTableInternal(const ::openmldb::api::TableMeta* table_meta
         msg.assign("table exists");
         return -1;
     }
-    Table* table_ptr = new MemTable(*table_meta);
+    // TODO
+    Table* table_ptr = Table::CreateTable(*table_meta, db_root_path);
     table.reset(table_ptr);
     if (!table->Init()) {
         PDLOG(WARNING, "fail to init table. tid %u, pid %u", table_meta->tid(), table_meta->pid());
         msg.assign("fail to init table");
         return -1;
     }
-    std::string db_root_path;
-    bool ok = ChooseDBRootPath(tid, pid, db_root_path);
-    if (!ok) {
-        PDLOG(WARNING, "fail to get table db root path");
-        msg.assign("fail to get table db root path");
+
+    ::openmldb::storage::Snapshot* snapshot_ptr = new ::openmldb::storage::DiskTableSnapshot(
+            table_meta->tid(), table_meta->pid(), table_meta->storage_mode(), db_root_path);
+    if (!snapshot_ptr->Init()) {
+        PDLOG(WARNING, "fail to init snapshot for tid %u, pid %u",
+              table_meta->tid(), table_meta->pid());
+        msg.assign("fail to init snapshot");
         return -1;
     }
+    
     std::string table_db_path = GetDBPath(db_root_path, tid, pid);
     std::shared_ptr<LogReplicator> replicator;
     if (table->IsLeader()) {
@@ -3935,8 +4004,8 @@ void TabletImpl::SchedDelBinlog(uint32_t tid, uint32_t pid) {
     }
 }
 
-bool TabletImpl::ChooseDBRootPath(uint32_t tid, uint32_t pid, std::string& path) {
-    std::vector<std::string>& paths = mode_root_paths_;
+bool TabletImpl::ChooseDBRootPath(uint32_t tid, uint32_t pid, const ::openmldb::common::StorageMode& mode, std::string& path) {
+    std::vector<std::string>& paths = mode_root_paths_[mode];
     if (paths.size() < 1) {
         return false;
     }
@@ -3952,8 +4021,8 @@ bool TabletImpl::ChooseDBRootPath(uint32_t tid, uint32_t pid, std::string& path)
     return path.size();
 }
 
-bool TabletImpl::ChooseRecycleBinRootPath(uint32_t tid, uint32_t pid, std::string& path) {
-    std::vector<std::string>& paths = mode_recycle_root_paths_;
+bool TabletImpl::ChooseRecycleBinRootPath(uint32_t tid, uint32_t pid, const ::openmldb::common::StorageMode& mode, std::string& path) {
+    std::vector<std::string>& paths = mode_recycle_root_paths_[mode];
     if (paths.size() < 1) return false;
 
     if (paths.size() == 1) {
@@ -4007,9 +4076,9 @@ bool TabletImpl::CreateMultiDir(const std::vector<std::string>& dirs) {
     return true;
 }
 
-bool TabletImpl::ChooseTableRootPath(uint32_t tid, uint32_t pid, std::string& path) {
+bool TabletImpl::ChooseTableRootPath(uint32_t tid, uint32_t pid, const ::openmldb::common::StorageMode& mode, std::string& path) {
     std::string root_path;
-    bool ok = ChooseDBRootPath(tid, pid, root_path);
+    bool ok = ChooseDBRootPath(tid, pid, mode, root_path);
     if (!ok) {
         PDLOG(WARNING, "table db path doesn't found. tid %u, pid %u", tid, pid);
         return false;
@@ -4076,8 +4145,14 @@ void TabletImpl::DeleteIndex(RpcController* controller, const ::openmldb::api::D
         response->set_msg("table is not exist");
         return;
     }
+    if (table->GetStorageMode() != ::openmldb::common::kMemory) {
+        response->set_code(::openmldb::base::ReturnCode::kOperatorNotSupport);
+        response->set_msg("only support mem_table");
+        PDLOG(WARNING, "only support mem_table. tid %u, pid %u", tid, pid);
+        return;
+    }
     std::string root_path;
-    if (!ChooseDBRootPath(tid, pid, root_path)) {
+    if (!ChooseDBRootPath(tid, pid, ::openmldb::common::kMemory, root_path)) {
         response->set_code(::openmldb::base::ReturnCode::kFailToGetDbRootPath);
         response->set_msg("fail to get table db root path");
         PDLOG(WARNING, "table db path is not found. tid %u, pid %u", tid, pid);
@@ -4147,7 +4222,7 @@ void TabletImpl::SendIndexDataInternal(std::shared_ptr<::openmldb::storage::Tabl
     uint32_t tid = table->GetId();
     uint32_t pid = table->GetPid();
     std::string db_root_path;
-    if (!ChooseDBRootPath(tid, pid, db_root_path)) {
+    if (!ChooseDBRootPath(tid, pid, table->GetStorageMode(), db_root_path)) {
         PDLOG(WARNING, "fail to find db root path for table tid %u pid %u", tid, pid);
         SetTaskStatus(task_ptr, ::openmldb::api::TaskStatus::kFailed);
         return;
@@ -4171,7 +4246,7 @@ void TabletImpl::SendIndexDataInternal(std::shared_ptr<::openmldb::storage::Tabl
                 return;
             }
             std::string des_db_root_path;
-            if (!ChooseDBRootPath(tid, kv.first, des_db_root_path)) {
+            if (!ChooseDBRootPath(tid, kv.first, table->GetStorageMode(), des_db_root_path)) {
                 PDLOG(WARNING, "fail to find db root path for table tid %u pid %u", tid, kv.first);
                 SetTaskStatus(task_ptr, ::openmldb::api::TaskStatus::kFailed);
                 return;
@@ -4294,7 +4369,7 @@ void TabletImpl::DumpIndexDataInternal(std::shared_ptr<::openmldb::storage::Tabl
     uint32_t tid = table->GetId();
     uint32_t pid = table->GetPid();
     std::string db_root_path;
-    if (!ChooseDBRootPath(tid, pid, db_root_path)) {
+    if (!ChooseDBRootPath(tid, pid, table->GetStorageMode(), db_root_path)) {
         PDLOG(WARNING, "fail to find db root path for table tid %u pid %u", tid, pid);
         SetTaskStatus(task, ::openmldb::api::kFailed);
         return;
@@ -4405,7 +4480,7 @@ void TabletImpl::LoadIndexDataInternal(uint32_t tid, uint32_t pid, uint32_t cur_
         return;
     }
     std::string db_root_path;
-    bool ok = ChooseDBRootPath(tid, pid, db_root_path);
+    bool ok = ChooseDBRootPath(tid, pid, table->GetStorageMode(), db_root_path);
     if (!ok) {
         PDLOG(WARNING, "fail to find db root path for table tid %u pid %u", tid, pid);
         SetTaskStatus(task, ::openmldb::api::TaskStatus::kFailed);
@@ -4639,7 +4714,7 @@ void TabletImpl::AddIndex(RpcController* controller, const ::openmldb::api::AddI
         }
     }
     std::string db_root_path;
-    bool ok = ChooseDBRootPath(tid, pid, db_root_path);
+    bool ok = ChooseDBRootPath(tid, pid, ::openmldb::common::StorageMode::kMemory, db_root_path);
     if (!ok) {
         base::SetResponseStatus(base::ReturnCode::kFailToGetDbRootPath, "fail to get db root path", response);
         PDLOG(WARNING, "fail to get table db root path for tid %u, pid %u", tid, pid);

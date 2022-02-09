@@ -92,6 +92,10 @@ class Table {
         return "";
     }
 
+    inline ::openmldb::common::StorageMode GetStorageMode() const {
+        return storage_mode_;
+    }
+
     inline uint32_t GetId() const { return id_; }
 
     inline uint32_t GetIdxCnt() const { return table_index_.Size(); }
