@@ -2222,6 +2222,7 @@ int NameServerImpl::CreateTableOnTablet(const std::shared_ptr<::openmldb::namese
     table_meta.set_seg_cnt(static_cast<::google::protobuf::int32>(table_info->seg_cnt()));
     table_meta.set_compress_type(compress_type);
     table_meta.set_format_version(table_info->format_version());
+    table_meta.set_storage_mode(table_info->storage_mode());
     if (table_info->has_key_entry_max_height()) {
         table_meta.set_key_entry_max_height(table_info->key_entry_max_height());
     }
