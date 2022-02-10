@@ -62,6 +62,7 @@ using ::openmldb::base::ReturnCode;
 using ::openmldb::codec::SchemaCodec;
 using ::openmldb::storage::DataBlock;
 using ::openmldb::storage::Table;
+using ::openmldb::storage::DiskTable;
 
 DECLARE_int32(gc_interval);
 DECLARE_int32(gc_pool_size);
@@ -2857,7 +2858,7 @@ void TabletImpl::LoadTable(RpcController* controller, const ::openmldb::api::Loa
         }
 
         if (table_meta.storage_mode() == openmldb::common::kMemory) {
-            if (CreateTableInternal(&table_meta, msg) < 0) {
+            if (CreateTableInternal(&table_meta, false, msg) < 0) {
                 response->set_code(::openmldb::base::ReturnCode::kCreateTableFailed);
                 response->set_msg(msg.c_str());
                 break;
@@ -2908,7 +2909,7 @@ int TabletImpl::LoadTableInternal(uint32_t tid, uint32_t pid, std::shared_ptr<::
         uint64_t latest_offset = 0;
         uint64_t snapshot_offset = 0;
         std::string db_root_path;
-        bool ok = ChooseDBRootPath(tid, pid, db_root_path);
+        bool ok = ChooseDBRootPath(tid, pid, table->GetStorageMode(), db_root_path);
         if (!ok) {
             PDLOG(WARNING, "fail to find db root path for table tid %u pid %u", tid, pid);
             break;
@@ -2941,6 +2942,101 @@ int TabletImpl::LoadTableInternal(uint32_t tid, uint32_t pid, std::shared_ptr<::
     return -1;
 }
 
+int TabletImpl::LoadDiskTableInternal(uint32_t tid, uint32_t pid, const ::openmldb::api::TableMeta& table_meta,
+                                      std::shared_ptr<::openmldb::api::TaskInfo> task_ptr) {
+    do {
+        std::string db_root_path;
+        bool ok = ChooseDBRootPath(tid, pid, table_meta.storage_mode(), db_root_path);
+        if (!ok) {
+            PDLOG(WARNING, "fail to find db root path for table tid %u pid %u", tid, pid);
+            break;
+        }
+        std::string table_path = db_root_path + "/" + std::to_string(tid) + "_" + std::to_string(pid);
+        std::string snapshot_path = table_path + "/snapshot/";
+        ::openmldb::api::Manifest manifest;
+        uint64_t snapshot_offset = 0;
+        std::string data_path = table_path + "/data";
+        if (::openmldb::base::IsExists(data_path)) {
+            if (!::openmldb::base::RemoveDir(data_path)) {
+                PDLOG(WARNING, "remove dir failed. tid %u pid %u path %s", tid, pid, data_path.c_str());
+                break;
+            }
+        }
+        bool need_load = false;
+        std::string manifest_file = snapshot_path + "MANIFEST";
+        if (Snapshot::GetLocalManifest(manifest_file, manifest) == 0) {
+            std::string snapshot_dir = snapshot_path + manifest.name();
+            PDLOG(INFO, "rename dir %s to %s. tid %u pid %u", snapshot_dir.c_str(), data_path.c_str(), tid, pid);
+            if (!::openmldb::base::Rename(snapshot_dir, data_path)) {
+                PDLOG(WARNING, "rename dir failed. tid %u pid %u path %s", tid, pid, snapshot_dir.c_str());
+                break;
+            }
+            if (unlink(manifest_file.c_str()) < 0) {
+                PDLOG(WARNING, "remove manifest failed. tid %u pid %u path %s", tid, pid, manifest_file.c_str());
+                break;
+            }
+            snapshot_offset = manifest.offset();
+            need_load = true;
+        }
+        std::string msg;
+        if (CreateTableInternal(&table_meta, need_load, msg) < 0) {
+            PDLOG(WARNING, "create table failed. tid %u pid %u msg %s", tid, pid, msg.c_str());
+            break;
+        }
+        // load snapshot data
+        std::shared_ptr<Table> table = GetTable(tid, pid);
+        if (!table) {
+            PDLOG(WARNING, "table with tid %u and pid %u does not exist", tid, pid);
+            break;
+        }
+        DiskTable* disk_table = dynamic_cast<DiskTable*>(table.get());
+        if (disk_table == NULL) {
+            break;
+        }
+        std::shared_ptr<Snapshot> snapshot = GetSnapshot(tid, pid);
+        if (!snapshot) {
+            PDLOG(WARNING, "snapshot with tid %u and pid %u does not exist", tid, pid);
+            break;
+        }
+        std::shared_ptr<LogReplicator> replicator = GetReplicator(tid, pid);
+        if (!replicator) {
+            PDLOG(WARNING, "replicator with tid %u and pid %u does not exist", tid, pid);
+            break;
+        }
+        {
+            std::lock_guard<SpinMutex> spin_lock(spin_mutex_);
+            table->SetTableStat(::openmldb::storage::kLoading);
+        }
+        uint64_t latest_offset = 0;
+        std::string binlog_path = table_path + "/binlog/";
+        ::openmldb::storage::Binlog binlog(replicator->GetLogPart(), binlog_path);
+        if (binlog.RecoverFromBinlog(table, snapshot_offset, latest_offset)) {
+            table->SetTableStat(::openmldb::storage::kNormal);
+            replicator->SetOffset(latest_offset);
+            replicator->SetSnapshotLogPartIndex(snapshot->GetOffset());
+            replicator->StartSyncing();
+            disk_table->SetOffset(latest_offset);
+            table->SchedGc();
+            gc_pool_.DelayTask(FLAGS_gc_interval * 60 * 1000, boost::bind(&TabletImpl::GcTable, this, tid, pid, false));
+            io_pool_.DelayTask(FLAGS_binlog_sync_to_disk_interval,
+                               boost::bind(&TabletImpl::SchedSyncDisk, this, tid, pid));
+            task_pool_.DelayTask(FLAGS_binlog_delete_interval,
+                                 boost::bind(&TabletImpl::SchedDelBinlog, this, tid, pid));
+            PDLOG(INFO, "load table success. tid %u pid %u", tid, pid);
+            MakeSnapshotInternal(tid, pid, 0, std::shared_ptr<::openmldb::api::TaskInfo>());
+            if (task_ptr) {
+                std::lock_guard<std::mutex> lock(mu_);
+                task_ptr->set_status(::openmldb::api::TaskStatus::kDone);
+                return 0;
+            }
+        } else {
+            DeleteTableInternal(tid, pid, std::shared_ptr<::openmldb::api::TaskInfo>());
+        }
+    } while (0);
+    SetTaskStatus(task_ptr, ::openmldb::api::TaskStatus::kFailed);
+    return -1;
+}
+
 int32_t TabletImpl::DeleteTableInternal(uint32_t tid, uint32_t pid,
                                         std::shared_ptr<::openmldb::api::TaskInfo> task_ptr) {
     std::string root_path;
@@ -2958,7 +3054,7 @@ int32_t TabletImpl::DeleteTableInternal(uint32_t tid, uint32_t pid,
             PDLOG(WARNING, "fail to get db root path. tid %u pid %u", tid, pid);
             break;
         }
-        ok = ChooseRecycleBinRootPath(tid, pid, recycle_bin_root_path);
+        ok = ChooseRecycleBinRootPath(tid, pid, table->GetStorageMode(), recycle_bin_root_path);
         if (!ok) {
             PDLOG(WARNING, "fail to get recycle bin root path. tid %u pid %u", tid, pid);
             break;
@@ -3072,7 +3168,7 @@ void TabletImpl::CreateTable(RpcController* controller, const ::openmldb::api::C
         response->set_msg("write data failed");
         return;
     }
-    if (CreateTableInternal(table_meta, msg) < 0) {
+    if (CreateTableInternal(table_meta, false, msg) < 0) {
         response->set_code(::openmldb::base::ReturnCode::kCreateTableFailed);
         response->set_msg(msg.c_str());
         return;
@@ -3207,6 +3303,7 @@ int32_t TabletImpl::GetSnapshotOffset(uint32_t tid, uint32_t pid, openmldb::comm
 void TabletImpl::GetAllSnapshotOffset(RpcController* controller, const ::openmldb::api::EmptyRequest* request,
                                       ::openmldb::api::TableSnapshotOffsetResponse* response, Closure* done) {
     brpc::ClosureGuard done_guard(done);
+    std::map<uint32_t, openmldb::common::StorageMode> table_sm;
     std::map<uint32_t, std::vector<uint32_t>> tid_pid;
     {
         std::lock_guard<SpinMutex> spin_lock(spin_mutex_);
@@ -3217,9 +3314,11 @@ void TabletImpl::GetAllSnapshotOffset(RpcController* controller, const ::openmld
             uint32_t tid = table_iter->first;
             std::vector<uint32_t> pids;
             auto part_iter = table_iter->second.begin();
+            openmldb::common::StorageMode sm = part_iter->second->GetStorageMode();
             for (; part_iter != table_iter->second.end(); part_iter++) {
                 pids.push_back(part_iter->first);
             }
+            table_sm.insert(std::make_pair(tid, sm));
             tid_pid.insert(std::make_pair(tid, pids));
         }
     }
@@ -3230,7 +3329,8 @@ void TabletImpl::GetAllSnapshotOffset(RpcController* controller, const ::openmld
         table->set_tid(tid);
         for (auto pid : iter->second) {
             uint64_t term = 0, offset = 0;
-            int32_t code = GetSnapshotOffset(tid, pid, msg, term, offset);
+            openmldb::common::StorageMode sm = table_sm.find(tid)->second;
+            int32_t code = GetSnapshotOffset(tid, pid, sm, msg, term, offset);
             if (code != 0) {
                 continue;
             }
@@ -3270,13 +3370,17 @@ void TabletImpl::GetTermPair(RpcController* controller, const ::openmldb::api::G
     uint32_t tid = request->tid();
     uint32_t pid = request->pid();
     std::shared_ptr<Table> table = GetTable(tid, pid);
+    ::openmldb::common::StorageMode mode = ::openmldb::common::kMemory;
+    if (request->has_storage_mode()) {
+        mode = request->storage_mode();
+    }
     if (!table) {
         response->set_code(::openmldb::base::ReturnCode::kOk);
         response->set_has_table(false);
         response->set_msg("table is not exist");
         std::string msg;
         uint64_t term = 0, offset = 0;
-        int32_t code = GetSnapshotOffset(tid, pid, msg, term, offset);
+        int32_t code = GetSnapshotOffset(tid, pid, mode, msg, term, offset);
         response->set_code(code);
         if (code == 0) {
             response->set_term(term);
@@ -3326,7 +3430,7 @@ void TabletImpl::DeleteBinlog(RpcController* controller, const ::openmldb::api::
     if (::openmldb::base::IsExists(binlog_path)) {
         if (FLAGS_recycle_bin_enabled) {
             std::string recycle_bin_root_path;
-            ok = ChooseRecycleBinRootPath(tid, pid, recycle_bin_root_path);
+            ok = ChooseRecycleBinRootPath(tid, pid, mode, recycle_bin_root_path);
             if (!ok) {
                 response->set_code(::openmldb::base::ReturnCode::kFailToGetRecycleRootPath);
                 response->set_msg("fail to get recycle root path");
@@ -3485,7 +3589,7 @@ int TabletImpl::UpdateTableMeta(const std::string& path, ::openmldb::api::TableM
     return UpdateTableMeta(path, table_meta, false);
 }
 
-int TabletImpl::CreateTableInternal(const ::openmldb::api::TableMeta* table_meta, std::string& msg) {
+int TabletImpl::CreateTableInternal(const ::openmldb::api::TableMeta* table_meta, bool is_load, std::string& msg) {
     uint32_t tid = table_meta->tid();
     uint32_t pid = table_meta->pid();
     std::map<std::string, std::string> real_ep_map;
@@ -3512,24 +3616,23 @@ int TabletImpl::CreateTableInternal(const ::openmldb::api::TableMeta* table_meta
         msg.assign("table exists");
         return -1;
     }
-    // TODO
     Table* table_ptr = Table::CreateTable(*table_meta, db_root_path);
     table.reset(table_ptr);
-    if (!table->Init()) {
-        PDLOG(WARNING, "fail to init table. tid %u, pid %u", table_meta->tid(), table_meta->pid());
-        msg.assign("fail to init table");
-        return -1;
+
+    if (table_meta->storage_mode() != openmldb::common::StorageMode::kMemory && is_load) {
+        if (!table_ptr->LoadTable()) {
+            return -1;
+        }
+        PDLOG(INFO, "load disk table. tid %u pid %u", tid, pid);
+    } else {
+        if (!table->Init()) {
+            PDLOG(WARNING, "fail to init table. tid %u, pid %u", table_meta->tid(), table_meta->pid());
+            msg.assign("fail to init table");
+            return -1;
+        }
+        PDLOG(INFO, "create table. tid %u pid %u", tid, pid);
     }
 
-    ::openmldb::storage::Snapshot* snapshot_ptr = new ::openmldb::storage::DiskTableSnapshot(
-            table_meta->tid(), table_meta->pid(), table_meta->storage_mode(), db_root_path);
-    if (!snapshot_ptr->Init()) {
-        PDLOG(WARNING, "fail to init snapshot for tid %u, pid %u",
-              table_meta->tid(), table_meta->pid());
-        msg.assign("fail to init snapshot");
-        return -1;
-    }
-    
     std::string table_db_path = GetDBPath(db_root_path, tid, pid);
     std::shared_ptr<LogReplicator> replicator;
     if (table->IsLeader()) {
@@ -3554,14 +3657,26 @@ int TabletImpl::CreateTableInternal(const ::openmldb::api::TableMeta* table_meta
     if (!zk_cluster_.empty() && table_meta->mode() == ::openmldb::api::TableMode::kTableLeader) {
         replicator->SetLeaderTerm(table_meta->term());
     }
-    ::openmldb::storage::Snapshot* snapshot_ptr = new ::openmldb::storage::MemTableSnapshot(
-        tid, pid, replicator->GetLogPart(), db_root_path);
 
-    if (!snapshot_ptr->Init()) {
-        PDLOG(WARNING, "fail to init snapshot for tid %u, pid %u", tid, pid);
-        msg.assign("fail to init snapshot");
-        return -1;
+    ::openmldb::storage::Snapshot* snapshot_ptr;
+    if (table_meta->storage_mode() == openmldb::common::StorageMode::kMemory) {
+        snapshot_ptr = new ::openmldb::storage::MemTableSnapshot(tid, pid, replicator->GetLogPart(), db_root_path);
+
+        if (!snapshot_ptr->Init()) {
+            PDLOG(WARNING, "fail to init snapshot for tid %u, pid %u", tid, pid);
+            msg.assign("fail to init snapshot");
+            return -1;
+        }
+    } else {
+        snapshot_ptr = new ::openmldb::storage::DiskTableSnapshot(table_meta->tid(), table_meta->pid(),
+                                                                  table_meta->storage_mode(), db_root_path);
+        if (!snapshot_ptr->Init()) {
+            PDLOG(WARNING, "fail to init snapshot for tid %u, pid %u", table_meta->tid(), table_meta->pid());
+            msg.assign("fail to init snapshot");
+            return -1;
+        }
     }
+
     std::shared_ptr<Snapshot> snapshot(snapshot_ptr);
     tables_[table_meta->tid()].insert(std::make_pair(table_meta->pid(), table));
     snapshots_[table_meta->tid()].insert(std::make_pair(table_meta->pid(), snapshot));
@@ -4069,8 +4184,10 @@ void TabletImpl::DelRecycle(const std::string& path) {
 }
 
 void TabletImpl::SchedDelRecycle() {
-    for (auto path : mode_recycle_root_paths_) {
-        DelRecycle(path);
+    for (auto kv : mode_recycle_root_paths_) {
+        for (auto path : kv.second) {
+            DelRecycle(path);
+        }
     }
     task_pool_.DelayTask(FLAGS_recycle_ttl * 60 * 1000, boost::bind(&TabletImpl::SchedDelRecycle, this));
 }
@@ -4103,9 +4220,9 @@ bool TabletImpl::ChooseTableRootPath(uint32_t tid, uint32_t pid, const ::openmld
     return true;
 }
 
-bool TabletImpl::GetTableRootSize(uint32_t tid, uint32_t pid, uint64_t& size) {
+bool TabletImpl::GetTableRootSize(uint32_t tid, uint32_t pid, const ::openmldb::common::StorageMode& mode, uint64_t& size) {
     std::string table_path;
-    if (!ChooseTableRootPath(tid, pid, table_path)) {
+    if (!ChooseTableRootPath(tid, pid, mode, table_path)) {
         return false;
     }
     if (!::openmldb::base::GetDirSizeRecur(table_path, size)) {
@@ -4127,7 +4244,7 @@ void TabletImpl::GetDiskused() {
     }
     for (const auto& table : tables) {
         uint64_t size = 0;
-        if (!GetTableRootSize(table->GetId(), table->GetPid(), size)) {
+        if (!GetTableRootSize(table->GetId(), table->GetPid(), table->GetStorageMode(), size)) {
             PDLOG(WARNING, "get table root size failed. tid[%u] pid[%u]", table->GetId(), table->GetPid());
         } else {
             table->SetDiskused(size);
@@ -4551,7 +4668,7 @@ void TabletImpl::LoadIndexDataInternal(uint32_t tid, uint32_t pid, uint32_t cur_
     if (cur_pid == partition_num - 1 || (cur_pid + 1 == pid && pid == partition_num - 1)) {
         if (FLAGS_recycle_bin_enabled) {
             std::string recycle_bin_root_path;
-            ok = ChooseRecycleBinRootPath(tid, pid, recycle_bin_root_path);
+            ok = ChooseRecycleBinRootPath(tid, pid, table->GetStorageMode(), recycle_bin_root_path);
             if (!ok) {
                 LOG(WARNING) << "fail to get recycle bin root path. tid " << tid << " pid " << pid;
                 openmldb::base::RemoveDirRecursive(index_path);
