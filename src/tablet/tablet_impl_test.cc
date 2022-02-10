@@ -43,6 +43,8 @@
 #include "test/util.h"
 
 DECLARE_string(db_root_path);
+DECLARE_string(ssd_root_path);
+DECLARE_string(hdd_root_path);
 DECLARE_string(zk_cluster);
 DECLARE_string(zk_root_path);
 DECLARE_int32(gc_interval);
@@ -52,6 +54,8 @@ DECLARE_uint32(max_traverse_cnt);
 DECLARE_bool(recycle_bin_enabled);
 DECLARE_string(db_root_path);
 DECLARE_string(recycle_bin_root_path);
+DECLARE_string(recycle_ssd_bin_root_path);
+DECLARE_string(recycle_hdd_bin_root_path);
 DECLARE_string(endpoint);
 DECLARE_uint32(recycle_ttl);
 

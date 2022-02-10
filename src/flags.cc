@@ -93,8 +93,8 @@ DEFINE_int32(request_timeout_ms, 20000, "request timeout");
 DEFINE_int32(request_sleep_time, 1000, "the sleep time when request error");
 
 DEFINE_uint32(max_traverse_cnt, 50000, "max traverse iter loop cnt");
-DEFINE_string(ssd_root_path, "", "the root ssd path of db");
-DEFINE_string(hdd_root_path, "", "the root hdd path of db");
+DEFINE_string(ssd_root_path, "/tmp/ssd/", "the root ssd path of db");
+DEFINE_string(hdd_root_path, "/tmp/hdd/", "the root hdd path of db");
 
 DEFINE_uint32(task_check_interval, 1000, "config the check interval of task");
 
@@ -117,7 +117,10 @@ DEFINE_int32(snapshot_pool_size, 1, "the size of tablet thread pool for making s
 
 DEFINE_uint32(load_index_max_wait_time, 120 * 60 * 1000, "config the max wait time of load index");
 
-DEFINE_string(recycle_bin_root_path, "/tmp/recycle", "specify the root path of recycle bin");
+DEFINE_string(recycle_bin_root_path, "/tmp/recycle/", "specify the root path of recycle bin");
+DEFINE_string(recycle_ssd_bin_root_path, "/tmp/recycle/ssd/", "specify the root path of recycle bin in ssd");
+DEFINE_string(recycle_hdd_bin_root_path, "/tmp/recycle/hdd/", "specify the root path of recycle bin in hdd");
+
 DEFINE_bool(recycle_bin_enabled, true, "enable the recycle bin storage");
 DEFINE_uint32(recycle_ttl, 0, "ttl of recycle in minute");
 
