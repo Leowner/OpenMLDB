@@ -66,6 +66,7 @@ using ::openmldb::storage::DiskTable;
 
 DECLARE_int32(gc_interval);
 DECLARE_int32(gc_pool_size);
+DECLARE_int32(disk_gc_interval);
 DECLARE_int32(statdb_ttl);
 DECLARE_uint32(scan_max_bytes_size);
 DECLARE_uint32(scan_reserve_size);
@@ -1258,7 +1259,7 @@ void TabletImpl::Count(RpcController* controller, const ::openmldb::api::CountRe
     }
     index = index_def->GetId();
     ttl = *index_def->GetTTL();
-    if (!request->filter_expired_data()) {
+    if (!request->filter_expired_data() && table->GetStorageMode() == ::openmldb::common::StorageMode::kMemory) {
         MemTable* mem_table = dynamic_cast<MemTable*>(table.get());
         if (mem_table != NULL) {
             uint64_t count = 0;
@@ -2228,6 +2229,7 @@ void TabletImpl::GetTableStatus(RpcController* controller, const ::openmldb::api
             status->set_tid(table->GetId());
             status->set_pid(table->GetPid());
             status->set_compress_type(table->GetCompressType());
+            status->set_storage_mode(table->GetStorageMode());
             status->set_name(table->GetName());
             status->set_diskused(table->GetDiskused());
             if (::openmldb::api::TableState_IsValid(table->GetTableStat())) {
@@ -2238,29 +2240,31 @@ void TabletImpl::GetTableStatus(RpcController* controller, const ::openmldb::api
                 status->set_offset(replicator->GetOffset());
             }
             status->set_record_cnt(table->GetRecordCnt());
-            if (MemTable* mem_table = dynamic_cast<MemTable*>(table.get())) {
-                status->set_is_expire(mem_table->GetExpireStatus());
-                status->set_record_byte_size(mem_table->GetRecordByteSize());
-                status->set_record_idx_byte_size(mem_table->GetRecordIdxByteSize());
-                status->set_record_pk_cnt(mem_table->GetRecordPkCnt());
-                status->set_skiplist_height(mem_table->GetKeyEntryHeight());
-                uint64_t record_idx_cnt = 0;
-                auto indexs = table->GetAllIndex();
-                for (const auto& index_def : indexs) {
-                    ::openmldb::api::TsIdxStatus* ts_idx_status = status->add_ts_idx_status();
-                    ts_idx_status->set_idx_name(index_def->GetName());
-                    uint64_t* stats = NULL;
-                    uint32_t size = 0;
-                    bool ok = mem_table->GetRecordIdxCnt(index_def->GetId(), &stats, &size);
-                    if (ok) {
-                        for (uint32_t i = 0; i < size; i++) {
-                            ts_idx_status->add_seg_cnts(stats[i]);
-                            record_idx_cnt += stats[i];
+            if (table->GetStorageMode() == ::openmldb::common::StorageMode::kMemory) {
+                if (MemTable* mem_table = dynamic_cast<MemTable*>(table.get())) {
+                    status->set_is_expire(mem_table->GetExpireStatus());
+                    status->set_record_byte_size(mem_table->GetRecordByteSize());
+                    status->set_record_idx_byte_size(mem_table->GetRecordIdxByteSize());
+                    status->set_record_pk_cnt(mem_table->GetRecordPkCnt());
+                    status->set_skiplist_height(mem_table->GetKeyEntryHeight());
+                    uint64_t record_idx_cnt = 0;
+                    auto indexs = table->GetAllIndex();
+                    for (const auto& index_def : indexs) {
+                        ::openmldb::api::TsIdxStatus* ts_idx_status = status->add_ts_idx_status();
+                        ts_idx_status->set_idx_name(index_def->GetName());
+                        uint64_t* stats = NULL;
+                        uint32_t size = 0;
+                        bool ok = mem_table->GetRecordIdxCnt(index_def->GetId(), &stats, &size);
+                        if (ok) {
+                            for (uint32_t i = 0; i < size; i++) {
+                                ts_idx_status->add_seg_cnts(stats[i]);
+                                record_idx_cnt += stats[i];
+                            }
                         }
+                        delete[] stats;
                     }
-                    delete[] stats;
+                    status->set_idx_cnt(record_idx_cnt);
                 }
-                status->set_idx_cnt(record_idx_cnt);
             }
         }
     }
@@ -2277,10 +2281,12 @@ void TabletImpl::SetExpire(RpcController* controller, const ::openmldb::api::Set
         response->set_msg("table is not exist");
         return;
     }
-    MemTable* mem_table = dynamic_cast<MemTable*>(table.get());
-    if (mem_table != NULL) {
-        mem_table->SetExpire(request->is_expire());
-        PDLOG(INFO, "set table expire[%d]. tid[%u] pid[%u]", request->is_expire(), request->tid(), request->pid());
+    if (table->GetStorageMode() == ::openmldb::common::StorageMode::kMemory) {
+        MemTable* mem_table = dynamic_cast<MemTable*>(table.get());
+        if (mem_table != NULL) {
+            mem_table->SetExpire(request->is_expire());
+            PDLOG(INFO, "set table expire[%d]. tid[%u] pid[%u]", request->is_expire(), request->tid(), request->pid());
+        }
     }
     response->set_code(::openmldb::base::ReturnCode::kOk);
     response->set_msg("ok");
@@ -2336,6 +2342,13 @@ void TabletImpl::MakeSnapshotInternal(uint32_t tid, uint32_t pid, uint64_t end_o
               "cur_offset[%lu], snapshot_offset[%lu] end_offset[%lu]",
               tid, pid, cur_offset, snapshot_offset, end_offset);
     } else {
+        if (table->GetStorageMode() != ::openmldb::common::StorageMode::kMemory) {
+            ::openmldb::storage::DiskTableSnapshot* disk_snapshot =
+                dynamic_cast<::openmldb::storage::DiskTableSnapshot*>(snapshot.get());
+            if (disk_snapshot != NULL) {
+                disk_snapshot->SetTerm(replicator->GetLeaderTerm());
+            }
+        }
         uint64_t offset = 0;
         ret = snapshot->MakeSnapshot(table, offset, end_offset);
         if (ret == 0) {
@@ -2354,9 +2367,11 @@ void TabletImpl::MakeSnapshotInternal(uint32_t tid, uint32_t pid, uint64_t end_o
         if (task) {
             if (ret == 0) {
                 task->set_status(::openmldb::api::kDone);
-                auto right_now = std::chrono::system_clock::now().time_since_epoch();
-                int64_t ts = std::chrono::duration_cast<std::chrono::seconds>(right_now).count();
-                table->SetMakeSnapshotTime(ts);
+                if (table->GetStorageMode() == common::StorageMode::kMemory) {
+                    auto right_now = std::chrono::system_clock::now().time_since_epoch();
+                    int64_t ts = std::chrono::duration_cast<std::chrono::seconds>(right_now).count();
+                    table->SetMakeSnapshotTime(ts);
+                }
             } else {
                 task->set_status(::openmldb::api::kFailed);
             }
@@ -2430,9 +2445,11 @@ void TabletImpl::SchedMakeSnapshot() {
                 if (iter->first == 0 && inner->first == 0) {
                     continue;
                 }
-                if (ts - inner->second->GetMakeSnapshotTime() <= FLAGS_make_snapshot_offline_interval &&
-                    !zk_cluster_.empty()) {
-                    continue;
+                if (inner->second->GetStorageMode() == ::openmldb::common::StorageMode::kMemory) {
+                    if (ts - inner->second->GetMakeSnapshotTime() <= FLAGS_make_snapshot_offline_interval &&
+                        !zk_cluster_.empty()) {
+                        continue;
+                    }
                 }
                 table_set.push_back(std::make_pair(iter->first, inner->first));
             }
@@ -2676,10 +2693,17 @@ void TabletImpl::SendSnapshotInternal(const std::string& endpoint, uint32_t tid,
             }
             snapshot_file = manifest.name();
         }
-        // send snapshot file
-        if (sender.SendFile(snapshot_file, full_path + snapshot_file) < 0) {
-            PDLOG(WARNING, "send snapshot failed. tid[%u] pid[%u]", tid, pid);
-            break;
+        if (table->GetStorageMode() == ::openmldb::common::StorageMode::kMemory) {
+            // send snapshot file
+            if (sender.SendFile(snapshot_file, full_path + snapshot_file) < 0) {
+                PDLOG(WARNING, "send snapshot failed. tid[%u] pid[%u]", tid, pid);
+                break;
+            }
+        } else {
+            if (sender.SendDir(snapshot_file, full_path + snapshot_file) < 0) {
+                PDLOG(WARNING, "send snapshot failed. tid[%u] pid[%u]", tid, pid);
+                break;
+            }
         }
         // send manifest file
         file_name = "MANIFEST";
@@ -3885,6 +3909,9 @@ void TabletImpl::GcTable(uint32_t tid, uint32_t pid, bool execute_once) {
     std::shared_ptr<Table> table = GetTable(tid, pid);
     if (table) {
         int32_t gc_interval = FLAGS_gc_interval;
+        if (table->GetStorageMode() != ::openmldb::common::StorageMode::kMemory) {
+            gc_interval = FLAGS_disk_gc_interval;
+        }
         table->SchedGc();
         if (!execute_once) {
             gc_pool_.DelayTask(gc_interval * 60 * 1000, boost::bind(&TabletImpl::GcTable, this, tid, pid, false));
@@ -4464,6 +4491,11 @@ void TabletImpl::DumpIndexData(RpcController* controller, const ::openmldb::api:
                 response->set_msg("table is not exist");
                 break;
             }
+            if (table->GetStorageMode() != ::openmldb::common::kMemory) {
+                response->set_code(::openmldb::base::ReturnCode::kOperatorNotSupport);
+                response->set_msg("only support mem_table");
+                break;
+            }
             if (table->GetTableStat() != ::openmldb::storage::kNormal) {
                 PDLOG(WARNING, "table state is %d, cannot dump index data. %u, pid %u", table->GetTableStat(), tid,
                       pid);
@@ -4559,6 +4591,12 @@ void TabletImpl::LoadIndexData(RpcController* controller, const ::openmldb::api:
             PDLOG(WARNING, "table is not exist. tid %u, pid %u", tid, pid);
             response->set_code(::openmldb::base::ReturnCode::kTableIsNotExist);
             response->set_msg("table is not exist");
+            break;
+        }
+        if (table->GetStorageMode() != ::openmldb::common::kMemory) {
+            response->set_code(::openmldb::base::ReturnCode::kOperatorNotSupport);
+            response->set_msg("only support mem_table");
+            PDLOG(WARNING, "only support mem_table. tid %u, pid %u", tid, pid);
             break;
         }
         if (table->GetTableStat() != ::openmldb::storage::kNormal) {
@@ -4763,6 +4801,12 @@ void TabletImpl::ExtractIndexData(RpcController* controller, const ::openmldb::a
             if (!table) {
                 PDLOG(WARNING, "table is not exist. tid %u pid %u", tid, pid);
                 base::SetResponseStatus(base::ReturnCode::kTableIsNotExist, "table is not exist", response);
+                break;
+            }
+            if (table->GetStorageMode() != ::openmldb::common::kMemory) {
+                response->set_code(::openmldb::base::ReturnCode::kOperatorNotSupport);
+                PDLOG(WARNING, "only support mem_table. tid %u pid %u", tid, pid);
+                response->set_msg("only support mem_table");
                 break;
             }
             if (table->GetTableStat() != ::openmldb::storage::kNormal) {
