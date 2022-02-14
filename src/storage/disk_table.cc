@@ -670,7 +670,6 @@ TableIterator* DiskTable::NewIterator(uint32_t idx, const std::string& pk,
 // }
 
 TableIterator* DiskTable::NewTraverseIterator(uint32_t index) {
-    // TODO(tongxin):Error Here
     std::shared_ptr<IndexDef> index_def = table_index_.GetIndex(index);
     PDLOG(ERROR, "%d", index);
     if (!index_def) {
@@ -839,6 +838,21 @@ void DiskTableTraverseIterator::Next() {
         std::string last_pk = pk_;
         uint8_t cur_ts_idx = UINT8_MAX;
         traverse_cnt_++;
+        ParseKeyAndTs(has_ts_idx_, it_->key(), pk_, ts_, cur_ts_idx);
+        if (last_pk == pk_) {
+            if (has_ts_idx_ && (cur_ts_idx != ts_idx_)) {
+                traverse_cnt_--;
+                continue;
+            }
+            record_idx_++;
+        } else {
+            record_idx_ = 0;
+            if (has_ts_idx_ && (cur_ts_idx != ts_idx_)) {
+                traverse_cnt_--;
+                continue;
+            }
+            record_idx_ = 1;
+        }
         if (traverse_cnt_ >= FLAGS_max_traverse_cnt) {
             if (has_ts_idx_) {
                 uint64_t ts = 0;
@@ -849,19 +863,6 @@ void DiskTableTraverseIterator::Next() {
                 }
             }
             break;
-        }
-        ParseKeyAndTs(has_ts_idx_, it_->key(), pk_, ts_, cur_ts_idx);
-        if (last_pk == pk_) {
-            if (has_ts_idx_ && (cur_ts_idx != ts_idx_)) {
-                continue;
-            }
-            record_idx_++;
-        } else {
-            record_idx_ = 0;
-            if (has_ts_idx_ && (cur_ts_idx != ts_idx_)) {
-                continue;
-            }
-            record_idx_ = 1;
         }
         if (IsExpired()) {
             NextPK();

@@ -882,8 +882,7 @@ TEST_F(TableTest, TableIteratorTSDisk) {
 
 
 void TraverseIteratorCount(::openmldb::common::StorageMode storageMode) {
-    uint32_t old_max_traverse = FLAGS_max_traverse_cnt;
-    FLAGS_max_traverse_cnt = 50;
+    
     ::openmldb::api::TableMeta table_meta;
     table_meta.set_name("table1");
     table_meta.set_tid(18);
@@ -930,22 +929,75 @@ void TraverseIteratorCount(::openmldb::common::StorageMode storageMode) {
     while (it->Valid()) {
         count++;
         it->Next();
-        PDLOG(ERROR, "it->GetCount() = %d", (int64_t)it->GetCount());
     }
-    ASSERT_EQ(1000, count);
-    ASSERT_EQ(1100, (int64_t)it->GetCount());
+
+    if (storageMode == ::openmldb::common::StorageMode::kMemory) {
+        ASSERT_EQ(1000, count);
+        ASSERT_EQ(1100, (int64_t)it->GetCount());
+    } else {
+        ASSERT_EQ(100, count);
+        ASSERT_EQ(100, (int64_t)it->GetCount());
+    }
+    
     delete it;
 
-    it = table->NewTraverseIterator(1);
+    it = table->NewTraverseIterator(2);
     it->SeekToFirst();
     count = 0;
     while (it->Valid()) {
         count++;
         it->Next();
     }
-    ASSERT_EQ(1000, count);
-    ASSERT_EQ(1100, (int64_t)it->GetCount());
+    if (storageMode == ::openmldb::common::StorageMode::kMemory) {
+        ASSERT_EQ(1000, count);
+        ASSERT_EQ(1100, (int64_t)it->GetCount());
+    } else {
+        ASSERT_EQ(1000, count);
+        ASSERT_EQ(1000, (int64_t)it->GetCount());
+    }
+
     delete it;
+
+
+    uint32_t old_max_traverse = FLAGS_max_traverse_cnt;
+    FLAGS_max_traverse_cnt = 50;
+
+    it = table->NewTraverseIterator(0);
+    it->SeekToFirst();
+    count = 0;
+    while (it->Valid()) {
+        count++;
+        it->Next();
+    }
+
+    if (storageMode == ::openmldb::common::StorageMode::kMemory) {
+        ASSERT_EQ(1000, count);
+        ASSERT_EQ(1100, (int64_t)it->GetCount());
+    } else {
+        ASSERT_EQ(49, count);
+        ASSERT_EQ(50, (int64_t)it->GetCount());
+    }
+    
+    delete it;
+
+    it = table->NewTraverseIterator(2);
+    it->SeekToFirst();
+    count = 0;
+    while (it->Valid()) {
+        count++;
+        it->Next();
+    }
+    if (storageMode == ::openmldb::common::StorageMode::kMemory) {
+        ASSERT_EQ(1000, count);
+        ASSERT_EQ(1100, (int64_t)it->GetCount());
+    } else {
+        ASSERT_EQ(49, count);
+        ASSERT_EQ(50, (int64_t)it->GetCount());
+    }
+
+    delete it;
+
+
     FLAGS_max_traverse_cnt = old_max_traverse;
 }
 
@@ -1471,62 +1523,7 @@ TEST_F (TableTest, TableIteratorTS2Disk) {
 }
 
 
-TEST_F (TableTest, TableIteratorTS3Disk) {
-    ::openmldb::api::TableMeta table_meta;
-    table_meta.set_name("table1");
-    table_meta.set_tid(26);
-    table_meta.set_pid(1);
-    table_meta.set_seg_cnt(8);
-    table_meta.set_mode(::openmldb::api::TableMode::kTableLeader);
-    table_meta.set_key_entry_max_height(8);
-    table_meta.set_format_version(1);
-    table_meta.set_storage_mode(::openmldb::common::StorageMode::kHDD);
-    SchemaCodec::SetColumnDesc(table_meta.add_column_desc(), "card", ::openmldb::type::kString);
-    SchemaCodec::SetColumnDesc(table_meta.add_column_desc(), "mcc", ::openmldb::type::kString);
-    SchemaCodec::SetColumnDesc(table_meta.add_column_desc(), "price", ::openmldb::type::kBigInt);
-    SchemaCodec::SetColumnDesc(table_meta.add_column_desc(), "ts1", ::openmldb::type::kBigInt);
-    SchemaCodec::SetColumnDesc(table_meta.add_column_desc(), "ts2", ::openmldb::type::kBigInt);
-    SchemaCodec::SetIndex(table_meta.add_column_key(), "card", "card", "ts1", ::openmldb::type::kAbsoluteTime, 0, 0);
-    SchemaCodec::SetIndex(table_meta.add_column_key(), "mcc", "mcc", "ts2", ::openmldb::type::kAbsoluteTime, 0, 0);
-    Table* table = Table::CreateTable(table_meta, FLAGS_hdd_root_path);
-    table->Init();
-    codec::SDKCodec codec(table_meta);
 
-    for (int i = 0; i < 1000; i++) {
-        std::vector<std::string> row = {"card" + std::to_string(i % 100), "mcc" + std::to_string(i),
-            "13", std::to_string(1000 + i), std::to_string(1000 + i)};
-        ::openmldb::api::PutRequest request;
-        ::openmldb::api::Dimension* dim = request.add_dimensions();
-        dim->set_idx(0);
-        dim->set_key(row[0]);
-        dim = request.add_dimensions();
-        dim->set_idx(1);
-        dim->set_key(row[1]);
-        std::string value;
-        ASSERT_EQ(0, codec.EncodeRow(row, &value));
-        table->Put(0, value, request.dimensions());
-    }
-    TableIterator* it = table->NewTraverseIterator(0);
-    it->SeekToFirst();
-    int count = 0;
-    while (it->Valid()) {
-        count++;
-        it->Next();
-    }
-    ASSERT_EQ(100, count);
-
-    it = table->NewTraverseIterator(1);
-    it->SeekToFirst();
-    count = 0;
-    while (it->Valid()) {
-        count++;
-        it->Next();
-    }
-    ASSERT_EQ(1000, count);
-
-    delete it;
-    delete table;
-}
 
 
 int compareString(const rocksdb::Slice& a, const rocksdb::Slice& b) {
@@ -1613,6 +1610,63 @@ TEST_F (TableTest, TableIteratorSeekDisk) {
     delete table;
 }
 
+TEST_F (TableTest, TableIteratorTS3Disk) {
+    ::openmldb::api::TableMeta table_meta;
+    table_meta.set_name("table1");
+    table_meta.set_tid(26);
+    table_meta.set_pid(1);
+    table_meta.set_seg_cnt(8);
+    table_meta.set_mode(::openmldb::api::TableMode::kTableLeader);
+    table_meta.set_key_entry_max_height(8);
+    table_meta.set_format_version(1);
+    table_meta.set_storage_mode(::openmldb::common::StorageMode::kHDD);
+    SchemaCodec::SetColumnDesc(table_meta.add_column_desc(), "card", ::openmldb::type::kString);
+    SchemaCodec::SetColumnDesc(table_meta.add_column_desc(), "mcc", ::openmldb::type::kString);
+    SchemaCodec::SetColumnDesc(table_meta.add_column_desc(), "price", ::openmldb::type::kBigInt);
+    SchemaCodec::SetColumnDesc(table_meta.add_column_desc(), "ts1", ::openmldb::type::kBigInt);
+    SchemaCodec::SetColumnDesc(table_meta.add_column_desc(), "ts2", ::openmldb::type::kBigInt);
+    SchemaCodec::SetIndex(table_meta.add_column_key(), "card", "card", "ts1", ::openmldb::type::kAbsoluteTime, 0, 0);
+    SchemaCodec::SetIndex(table_meta.add_column_key(), "mcc", "mcc", "ts2", ::openmldb::type::kAbsoluteTime, 0, 0);
+    Table* table = Table::CreateTable(table_meta, FLAGS_hdd_root_path);
+    table->Init();
+    codec::SDKCodec codec(table_meta);
+
+    for (int i = 0; i < 1000; i++) {
+        std::vector<std::string> row = {"card" + std::to_string(i % 100), "mcc" + std::to_string(i),
+            "13", std::to_string(1000 + i), std::to_string(1000 + i)};
+        ::openmldb::api::PutRequest request;
+        ::openmldb::api::Dimension* dim = request.add_dimensions();
+        dim->set_idx(0);
+        dim->set_key(row[0]);
+        dim = request.add_dimensions();
+        dim->set_idx(1);
+        dim->set_key(row[1]);
+        std::string value;
+        ASSERT_EQ(0, codec.EncodeRow(row, &value));
+        table->Put(0, value, request.dimensions());
+    }
+    TableIterator* it = table->NewTraverseIterator(0);
+    it->SeekToFirst();
+    int count = 0;
+    while (it->Valid()) {
+        count++;
+        it->Next();
+    }
+    ASSERT_EQ(100, count);
+
+    it = table->NewTraverseIterator(1);
+    it->SeekToFirst();
+    count = 0;
+    while (it->Valid()) {
+        count++;
+        it->Next();
+    }
+    ASSERT_EQ(1000, count);
+
+    delete it;
+    delete table;
+}
+
 TEST_F (TableTest, CombineKeyTsDisk) {
     std::string stringa = CombineKeyTs("test3", 30);
     rocksdb::Slice a = rocksdb::Slice(stringa) ;
@@ -1627,6 +1681,24 @@ TEST_F (TableTest, CombineKeyTsDisk) {
     PDLOG(INFO, "compare:%d", compareString(b, c));
     PDLOG(INFO, "compare:%d", compareString(d, c));
 
+}
+
+TEST_F (TableTest, DiskTablePutTwice) {
+    std::map<std::string, uint32_t> mapping;
+    mapping.insert(std::make_pair("idx0", 0));
+    Table* table = Table::CreateTable("tx_log", 27, 1, 8, mapping, 0, ::openmldb::type::kAbsoluteTime,
+        FLAGS_hdd_root_path, ::openmldb::common::StorageMode::kHDD);
+    table->Init();
+
+    table->Put("pk", 9527, "test1", 5);
+    table->Put("pk", 9527, "test2", 5);
+    
+    Ticket ticket;
+    TableIterator* it = table->NewIterator("pk", ticket);
+    it->Seek(9527);
+    ASSERT_TRUE(it->Valid());
+    ASSERT_EQ("test2", it->GetValue());
+    
 }
 
 }  // namespace storage
