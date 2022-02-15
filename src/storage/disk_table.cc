@@ -246,9 +246,10 @@ bool DiskTable::Put(uint64_t time, const std::string& value,
                 it->key().c_str(), it->idx(), id_, pid_);
             return false;
         }
+        auto inner_index = table_index_.GetInnerIndex(inner_pos);
         auto ts_col = index_def->GetTsColumn();
         std::string combine_key;
-        if (ts_col) {
+        if (inner_index->GetIndex().size() > 1 && ts_col) {
             combine_key = CombineKeyTs(it->key(), time, ts_col->GetId());
         } else {
             combine_key = CombineKeyTs(it->key(), time);
@@ -671,7 +672,6 @@ TableIterator* DiskTable::NewIterator(uint32_t idx, const std::string& pk,
 
 TableIterator* DiskTable::NewTraverseIterator(uint32_t index) {
     std::shared_ptr<IndexDef> index_def = table_index_.GetIndex(index);
-    PDLOG(ERROR, "%d", index);
     if (!index_def) {
         return NULL;
     }
@@ -692,7 +692,6 @@ TableIterator* DiskTable::NewTraverseIterator(uint32_t index) {
     ro.snapshot = snapshot;
     // ro.prefix_same_as_start = true;
     ro.pin_data = true;
-    PDLOG(ERROR, "%d", inner_pos);
     rocksdb::Iterator* it = db_->NewIterator(ro, cf_hs_[inner_pos + 1]);
     if (inner_index && inner_index->GetIndex().size() > 1) {
         auto ts_col = index_def->GetTsColumn();
