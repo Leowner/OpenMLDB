@@ -41,9 +41,9 @@ enum TableStat { kUndefined = 0, kNormal, kLoading, kMakingSnapshot, kSnapshotPa
 class Table {
  public:
     Table();
-    Table(::openmldb::common::StorageMode storage_mode, const std::string& name, uint32_t id, uint32_t pid, uint64_t ttl, bool is_leader, uint64_t ttl_offset,
-          const std::map<std::string, uint32_t>& mapping, ::openmldb::type::TTLType ttl_type,
-          ::openmldb::type::CompressType compress_type);
+    Table(::openmldb::common::StorageMode storage_mode, const std::string& name, uint32_t id, uint32_t pid,
+          uint64_t ttl, bool is_leader, uint64_t ttl_offset, const std::map<std::string, uint32_t>& mapping,
+          ::openmldb::type::TTLType ttl_type, ::openmldb::type::CompressType compress_type);
     virtual ~Table() {}
     virtual bool Init() = 0;
 
@@ -52,7 +52,7 @@ class Table {
               ::openmldb::type::TTLType ttl_type,
               const std::string& db_root_path = "",
               ::openmldb::common::StorageMode storage_mode = openmldb::common::StorageMode::kMemory);
-    static Table* CreateTable( const ::openmldb::api::TableMeta& table_meta, const std::string& db_root_path = "");          
+    static Table* CreateTable(const ::openmldb::api::TableMeta& table_meta, const std::string& db_root_path = "");
     int InitColumnDesc();
 
     virtual bool Put(const std::string& pk, uint64_t time, const char* data, uint32_t size) = 0;

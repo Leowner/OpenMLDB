@@ -15,6 +15,9 @@
  */
 
 #include <gflags/gflags.h>
+#include <atomic>
+#include <iostream>
+#include <utility>
 
 #include "base/glog_wapper.h"
 #include "codec/schema_codec.h"
@@ -25,11 +28,7 @@
 #include "storage/ticket.h"
 #include "test/util.h"
 #include "storage/table.h"
-#include <atomic>
-
 #include "storage/disk_table.h"
-#include <iostream>
-#include <utility>
 #include "base/file_util.h"
 #include "storage/iterator.h"
 
@@ -79,7 +78,8 @@ void put(::openmldb::common::StorageMode storageMode) {
     std::map<std::string, uint32_t> mapping;
     mapping.insert(std::make_pair("idx0", 0));
     int id = ++counter;
-    Table* table = Table::CreateTable("tx_log", id, 1, 8, mapping, 10, ::openmldb::type::kAbsoluteTime, FLAGS_hdd_root_path, storageMode);
+    Table* table = Table::CreateTable("tx_log", id, 1, 8, mapping, 10, ::openmldb::type::kAbsoluteTime,
+                                      FLAGS_hdd_root_path, storageMode);
     table->Init();
     ASSERT_TRUE(table->Put("test", 9537, "test", 4));
     ASSERT_EQ(1, (int64_t)table->GetRecordCnt());
@@ -152,7 +152,8 @@ void MultiDimissionPut0(::openmldb::common::StorageMode storageMode) {
     mapping.insert(std::make_pair("idx1", 1));
     mapping.insert(std::make_pair("idx2", 2));
     int id = ++counter;
-    Table* table = Table::CreateTable("tx_log", id, 1, 8, mapping, 10, ::openmldb::type::kAbsoluteTime, FLAGS_hdd_root_path, storageMode);
+    Table* table = Table::CreateTable("tx_log", id, 1, 8, mapping, 10, ::openmldb::type::kAbsoluteTime,
+                                      FLAGS_hdd_root_path, storageMode);
     table->Init();
     ASSERT_EQ(3, (int64_t)table->GetIdxCnt());
     ASSERT_EQ(0, (int64_t)table->GetRecordIdxCnt());
@@ -1584,7 +1585,6 @@ TEST_F(TableTest, GcAbsAndLatMem) {
 // }
 
 void TraverseIteratorCountWithLimit(::openmldb::common::StorageMode storageMode) {
-
     uint32_t old_max_traverse = FLAGS_max_traverse_cnt;
     FLAGS_max_traverse_cnt = 50;
     

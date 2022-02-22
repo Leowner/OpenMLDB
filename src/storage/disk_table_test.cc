@@ -4,8 +4,7 @@
 // Author yangjun
 // Date 2018-01-07
 //
-
-#include "storage/disk_table.h"
+#include <gflags/gflags.h>
 #include <iostream>
 #include <utility>
 #include "base/file_util.h"
@@ -13,7 +12,7 @@
 #include "base/glog_wapper.h"  // NOLINT
 #include "common/timer.h"    // NOLINT
 #include "codec/schema_codec.h"
-#include <gflags/gflags.h>
+#include "storage/disk_table.h"
 #include "codec/sdk_codec.h"
 #include "storage/ticket.h"
 #include "test/util.h"
