@@ -182,8 +182,6 @@ bool DiskTable::InitColumnFamilyDescriptor() {
             rocksdb::ColumnFamilyDescriptor(index_def->GetName(), cfo));
         DEBUGLOG("add cf_name %s. tid %u pid %u",
               index_def->GetName().c_str(), id_, pid_);
-
-        
     }
     return true;
 }
@@ -1049,32 +1047,32 @@ void DiskTableTraverseIterator::NextPK() {
 }
 
 bool DiskTable::DeleteIndex(const std::string& idx_name) {
-    // TODO
+    // TODO(litongxin)
     return true;
 }
 
 uint64_t DiskTable::GetRecordIdxCnt() {
-    //TODO
+    // TODO(litongxin)
     return 0;
 }
 
 bool DiskTable::GetRecordIdxCnt(uint32_t idx, uint64_t** stat, uint32_t* size) {
-    //TODO
+    // TODO(litongxin)
     return true;
 }
 
 uint64_t DiskTable::GetRecordPkCnt() {
-    // TODO
+    // TODO(litongxin)
     return 0;
 }
 
 uint64_t DiskTable::GetRecordIdxByteSize() {
-    // TODO
+    // TODO(litongxin)
     return 0;
 }
 
 uint64_t DiskTable::Release() {
-    // TODO
+    // TODO(litongxin)
     return 0;
 }
 
